@@ -76,5 +76,5 @@ Credential storage, encryption, compression, logins and identity management belo
 - A handler must enforce idempotency for retried actions. The runtime reuses the idempotency key but cannot enforce external deduplication.
 - Physical deployments still require independent local interlocks and domain-specific safe-failure behavior.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the contract, adapter boundary and implementation roadmap. Retired implementations are kept out of the supported package under [`legacy/prototypes`](legacy/prototypes/README.md).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the contract, adapter boundary and implementation roadmap. Retired prototype implementations are not part of the supported UPMP source distribution.
 

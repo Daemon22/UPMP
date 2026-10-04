@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Separate activity-tracker utility; outside the UPMP core project.
+README_ADT.md
+silent_watcher.py
+upmp_adt.py
+test_88x8_results.json
+legacy/prototypes/
+UPMP_Framework_Documentation.pdf
+UPMP_Report.pdf
+
