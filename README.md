@@ -19,6 +19,8 @@ Determine → Verify → Insure → Orchestrate → observe result → Determine
 
 The framework can grow through adapters and hierarchical workflows. Domain values are normalized at adapter boundaries; the core does not assume that a pump, compiler, agent or service has the same state model.
 
+Use `StateSchema` and `SchemaRegistry` to validate versioned domain snapshots (field types, required fields, units, enumerations and numeric bounds). Verification policies also support inclusive `between` ranges and explicit `approx` tolerances. Unit conversion remains the adapter's responsibility.
+
 ## Quick start
 
 Install the package from this directory:

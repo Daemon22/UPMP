@@ -61,7 +61,7 @@ Identity, login, credential storage, encryption, compression and key management 
 
 The repository implements a first closed-loop slice of the contract, with these limits:
 
-- `UPMP/MonitoringEngine` evaluates the legacy numeric state model and emits a report. `UPMP/contracts.py` adds a separate versioned typed observation envelope, but JSON schema validation, domain schema registries and general categorical/range-valued desired-state models are not yet provided.
+- `UPMP/MonitoringEngine` evaluates the legacy numeric state model and emits a report. `UPMP/contracts.py` provides a versioned typed observation envelope, a schema registry for required/optional fields, JSON value types, units, enumerated values and numeric bounds, plus hard equality, membership, range and tolerance predicates. Unit conversion stays with domain adapters. The schema format is a focused Python contract, not a full JSON Schema implementation.
 - The current intent-preservation routine uses word matching, not a semantic or policy-grade audit. Trajectory and progress scores are heuristics and must not be interpreted as proof.
 - Checkpoint/rollback helpers operate on in-memory monitoring state. They do not restore arbitrary external systems.
 - `UPMP/closed_loop.py` integrates precondition verification, allow-listed action dispatch, an optional external authorization callback, result observation, postcondition verification and explicit branching in one bounded loop. Retired shell-runner and monolithic implementations are archived under `legacy/prototypes` and are not supported interfaces.
@@ -73,7 +73,7 @@ The repository implements a first closed-loop slice of the contract, with these 
 
 The next UPMP improvements should deepen its process-integrity domain:
 
-1. Add machine-readable state schema validation and richer desired-state predicates, including tolerances/ranges and explicit domain-side unit conversion.
+1. Done: machine-readable state schema validation and richer desired-state predicates, including tolerances/ranges and explicit domain-side unit conversion.
 2. Expand workflow semantics with explicit pause/resume snapshots, deadlines and handler-owned cancellation/reconciliation contracts.
 3. Make audit event storage pluggable while keeping retention and cryptographic integrity with the external logging/security service.
 4. Expand the simulation with unavailable/stale sensors, drift, action failure, recovery, scheduling and resume; keep physical adapters outside the proof until their independent safeguards are validated.

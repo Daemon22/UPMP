@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 class DataQuality(str, Enum):
@@ -65,6 +65,120 @@ class ProcessState:
 
 
 @dataclass(frozen=True)
+class FieldSchema:
+    """Machine-readable contract for one observation field.
+
+    ``value_type`` uses JSON Schema's basic type names. Units are labels only:
+    adapters remain responsible for converting values before state creation.
+    """
+    value_type: str
+    required: bool = True
+    unit: Optional[str] = None
+    enum: Sequence[Any] = ()
+    minimum: Optional[float] = None
+    maximum: Optional[float] = None
+
+    VALUE_TYPES = frozenset({"null", "boolean", "integer", "number", "string", "array", "object"})
+
+    def __post_init__(self) -> None:
+        if self.value_type not in self.VALUE_TYPES:
+            raise ValueError("unsupported schema value_type: %s" % self.value_type)
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("field minimum cannot exceed maximum")
+
+
+@dataclass(frozen=True)
+class StateSchema:
+    """Versioned state schema suitable for serialization by domain adapters."""
+    schema_id: str
+    version: str
+    fields: Mapping[str, FieldSchema]
+    allow_additional_fields: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.schema_id or not self.version:
+            raise ValueError("schema_id and version are required")
+        if any(not key for key in self.fields):
+            raise ValueError("schema field names must be non-empty")
+        if any(not isinstance(spec, FieldSchema) for spec in self.fields.values()):
+            raise TypeError("schema fields must be FieldSchema instances")
+
+
+@dataclass(frozen=True)
+class SchemaValidationResult:
+    valid: bool
+    schema_id: str
+    schema_version: str
+    errors: Sequence[str] = ()
+
+
+class SchemaRegistry:
+    """Validates states against explicitly registered schema versions."""
+
+    def __init__(self, schemas: Sequence[StateSchema] = ()) -> None:
+        self._schemas: Dict[Tuple[str, str], StateSchema] = {}
+        for schema in schemas:
+            self.register(schema)
+
+    def register(self, schema: StateSchema) -> None:
+        key = (schema.schema_id, schema.version)
+        if key in self._schemas:
+            raise ValueError("schema version already registered: %s@%s" % key)
+        self._schemas[key] = schema
+
+    def get(self, schema_id: str, version: str) -> Optional[StateSchema]:
+        return self._schemas.get((schema_id, version))
+
+    def validate(self, state: ProcessState) -> SchemaValidationResult:
+        schema = self.get(state.schema_id, state.schema_version)
+        if schema is None:
+            return SchemaValidationResult(False, state.schema_id, state.schema_version,
+                                          ("schema version is not registered",))
+        errors: List[str] = []
+        for name, spec in schema.fields.items():
+            observation = state.observations.get(name)
+            if observation is None:
+                if spec.required:
+                    errors.append("required observation is missing: %s" % name)
+                continue
+            if not _matches_type(observation.value, spec.value_type):
+                errors.append("%s must have type %s" % (name, spec.value_type))
+                continue
+            if spec.unit is not None and observation.unit != spec.unit:
+                errors.append("%s must use unit %s" % (name, spec.unit))
+            if spec.enum and observation.value not in spec.enum:
+                errors.append("%s must be one of the declared values" % name)
+            if isinstance(observation.value, (int, float)) and not isinstance(observation.value, bool):
+                if spec.minimum is not None and observation.value < spec.minimum:
+                    errors.append("%s is below minimum %s" % (name, spec.minimum))
+                if spec.maximum is not None and observation.value > spec.maximum:
+                    errors.append("%s is above maximum %s" % (name, spec.maximum))
+        if not schema.allow_additional_fields:
+            for name in state.observations:
+                if name not in schema.fields:
+                    errors.append("undeclared observation: %s" % name)
+        return SchemaValidationResult(not errors, schema.schema_id, schema.version, tuple(errors))
+
+
+def _matches_type(value: Any, value_type: str) -> bool:
+    if value_type == "null":
+        return value is None
+    if value_type == "boolean":
+        return isinstance(value, bool)
+    if value_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if value_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if value_type == "string":
+        return isinstance(value, str)
+    if value_type == "array":
+        return isinstance(value, (list, tuple))
+    if value_type == "object":
+        return isinstance(value, Mapping)
+    return False
+
+
+@dataclass(frozen=True)
 class Constraint:
     """A hard predicate. Missing/poor-quality observations never pass."""
     field: str
@@ -72,10 +186,11 @@ class Constraint:
     expected: Any = None
     unit: Optional[str] = None
     max_age_seconds: Optional[float] = None
+    tolerance: Optional[float] = None
     name: str = ""
     description: str = ""
 
-    OPERATORS = frozenset({"exists", "eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in"})
+    OPERATORS = frozenset({"exists", "eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "between", "approx"})
 
     def __post_init__(self) -> None:
         if not self.field:
@@ -84,6 +199,12 @@ class Constraint:
             raise ValueError("unsupported constraint operator: %s" % self.operator)
         if self.max_age_seconds is not None and self.max_age_seconds < 0:
             raise ValueError("max_age_seconds cannot be negative")
+        if self.tolerance is not None and self.tolerance < 0:
+            raise ValueError("tolerance cannot be negative")
+        if self.operator == "between" and (not isinstance(self.expected, (tuple, list)) or len(self.expected) != 2):
+            raise ValueError("between expects a two-item (minimum, maximum) range")
+        if self.operator == "approx" and self.tolerance is None:
+            raise ValueError("approx requires an explicit tolerance")
 
 
 @dataclass(frozen=True)
@@ -169,6 +290,8 @@ def _evaluate_constraint(c: Constraint, state: ProcessState, now: datetime) -> V
                 "gte": lambda: obs.value >= c.expected,
                 "in": lambda: obs.value in c.expected,
                 "not_in": lambda: obs.value not in c.expected,
+                "between": lambda: c.expected[0] <= obs.value <= c.expected[1],
+                "approx": lambda: abs(obs.value - c.expected) <= c.tolerance,
             }[c.operator]()
         except (TypeError, ValueError, KeyError):
             return VerificationFinding(name, FindingStatus.INDETERMINATE, "values cannot be compared", obs.value, c.expected, evidence=evidence)

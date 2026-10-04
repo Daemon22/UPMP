@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 from UPMP import (
     ActionDispatcher, ActionResult, ActionStatus, ClosedLoopOrchestrator,
-    Constraint, DataQuality, FindingStatus, Observation, ProcessState,
+    Constraint, DataQuality, FieldSchema, FindingStatus, Observation, ProcessState,
+    SchemaRegistry, StateSchema,
     RunStatus, VerificationPolicy, WorkflowStep,
 )
 
@@ -45,6 +46,59 @@ class VerificationTests(unittest.TestCase):
 
     def test_empty_policy_cannot_authorize_action(self):
         self.assertEqual(VerificationPolicy("empty", "1").evaluate(state()).status, FindingStatus.INDETERMINATE)
+
+    def test_range_and_tolerance_constraints(self):
+        p = policy("targets", Constraint("temperature", "between", (18, 24), unit="C"),
+                   Constraint("target", "approx", 20, tolerance=0.25, unit="C"))
+        self.assertEqual(p.evaluate(state(temperature=Observation(24, source="sensor", unit="C"),
+                                       target=Observation(20.2, source="sensor", unit="C"))).status,
+                         FindingStatus.PASS)
+        self.assertEqual(p.evaluate(state(temperature=Observation(24.1, source="sensor", unit="C"),
+                                       target=Observation(20.2, source="sensor", unit="C"))).status,
+                         FindingStatus.FAIL)
+        self.assertEqual(p.evaluate(state(temperature=Observation(20, source="sensor", unit="C"),
+                                       target=Observation(20.26, source="sensor", unit="C"))).status,
+                         FindingStatus.FAIL)
+
+    def test_range_and_approximation_configuration_is_explicit(self):
+        with self.assertRaises(ValueError):
+            Constraint("x", "between", (1,))
+        with self.assertRaises(ValueError):
+            Constraint("x", "approx", 1)
+
+    def test_versioned_schema_validation(self):
+        schema = StateSchema("irrigation", "2", {
+            "mains": FieldSchema("boolean"),
+            "pressure": FieldSchema("number", unit="kPa", minimum=0, maximum=500),
+            "mode": FieldSchema("string", enum=("idle", "watering", "fault")),
+            "optional": FieldSchema("integer", required=False),
+        })
+        registry = SchemaRegistry([schema])
+        valid = ProcessState("irrigation", "2", {
+            "mains": Observation(False, source="relay"),
+            "pressure": Observation(150, source="gauge", unit="kPa"),
+            "mode": Observation("idle", source="controller"),
+        })
+        self.assertTrue(registry.validate(valid).valid)
+        invalid = ProcessState("irrigation", "2", {
+            "mains": Observation(0, source="relay"),
+            "pressure": Observation(501, source="gauge", unit="psi"),
+            "mode": Observation("unknown", source="controller"),
+            "extra": Observation(True, source="controller"),
+        })
+        result = registry.validate(invalid)
+        self.assertFalse(result.valid)
+        self.assertTrue(any("mains must have type boolean" in error for error in result.errors))
+        self.assertTrue(any("pressure must use unit kPa" in error for error in result.errors))
+        self.assertTrue(any("pressure is above maximum" in error for error in result.errors))
+        self.assertTrue(any("mode must be one" in error for error in result.errors))
+        self.assertTrue(any("undeclared observation" in error for error in result.errors))
+        self.assertFalse(registry.validate(ProcessState("irrigation", "3", {})).valid)
+
+    def test_registry_rejects_duplicate_versions(self):
+        schema = StateSchema("x", "1", {})
+        with self.assertRaises(ValueError):
+            SchemaRegistry([schema, schema])
 
 
 class OrchestrationTests(unittest.TestCase):

@@ -119,7 +119,8 @@ from .engine import (
 )
 
 from .contracts import (
-    DataQuality, FindingStatus, Observation, ProcessState, Constraint,
+    DataQuality, FindingStatus, Observation, ProcessState, FieldSchema,
+    StateSchema, SchemaValidationResult, SchemaRegistry, Constraint,
     VerificationFinding, VerificationResult, VerificationPolicy,
 )
 from .closed_loop import (
@@ -160,6 +161,7 @@ __all__ = [
     "MonitoringEngine",
     # Domain-neutral contracts and closed-loop workflow runtime
     "DataQuality", "FindingStatus", "Observation", "ProcessState",
+    "FieldSchema", "StateSchema", "SchemaValidationResult", "SchemaRegistry",
     "Constraint", "VerificationFinding", "VerificationResult",
     "VerificationPolicy", "ActionStatus", "RunStatus", "ActionRequest",
     "ActionResult", "WorkflowStep", "AuditEvent", "WorkflowResult",
