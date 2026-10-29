@@ -71,11 +71,42 @@ The simulation switches to a simulated generator when mains power is unavailable
 
 Credential storage, encryption, compression, logins and identity management belong to the separate security service. UPMP accepts an optional authorization callback at action dispatch and an opaque `principal_ref`; it does not accept or store passwords, API keys, encryption keys or tokens. The callback is the seam for the external authorization engine.
 
+## Audit trail
+
+The runtime produces an `AuditEvent` per workflow step. By default these
+events are returned in `WorkflowResult.audit` and discarded when the
+process exits. For durable, hash-chained audit storage, pass an
+`AuditSink` to the orchestrator:
+
+```python
+from UPMP.audit import FileAuditSink, SQLiteAuditSink
+
+# JSONL file (one event per line, fsync per append)
+with FileAuditSink("audit.jsonl") as sink:
+    ClosedLoopOrchestrator(steps, dispatcher, audit_sink=sink).run(state)
+    sink.write_checkpoint("audit.checkpoint.json")  # trusted tip anchor
+
+# Or single-file SQLite (PRIMARY KEY enforces monotonic seq at DB layer)
+with SQLiteAuditSink("audit.db") as sink:
+    ClosedLoopOrchestrator(steps, dispatcher, audit_sink=sink).run(state)
+```
+
+The hash chain **detects** tampering with any non-terminal event;
+`write_checkpoint` / `verify_checkpoint` extend detection to the
+terminal event and to truncation, **provided the checkpoint file is
+stored in an independent trust domain** (out-of-band copy, signed
+blob, or another host). `fsync` and SQLite ACID give crash durability,
+**not** tamper-proof or append-only storage — those require OS-level
+controls (`chattr +a`), WORM storage, or an external transparency log.
+Full threat model and remaining limitations are documented in the
+`UPMP/audit.py` module docstring.
+
 ## Current limits
 
 - The numeric `MonitoringEngine` scores are heuristics. The typed `VerificationPolicy` is the hard pass/fail/indeterminate path.
-- The workflow runtime is in-process and keeps its audit events in memory. Action handlers run synchronously; persistent audit, safe cancellation and timeout guarantees are not provided.
-- A handler must enforce idempotency for retried actions. The runtime reuses the idempotency key but cannot enforce external deduplication.
+- The workflow runtime is in-process. Action handlers run synchronously. Durable, hash-chained audit storage **is** provided (`FileAuditSink`, `SQLiteAuditSink`) with a checkpoint mechanism for terminal-event authentication; **safe cancellation and timeout guarantees are still not provided** (deferred to M2).
+- A handler must enforce idempotency for retried actions. The runtime reuses the idempotency key but cannot enforce external deduplication (deferred to M3).
+- Audit storage is crash-durable but **not** tamper-proof against an attacker with write access to the storage file or database. Tamper **detection** is provided by the hash chain and the checkpoint mechanism; tamper **prevention** requires external controls (OS-level append-only flags, WORM storage, or a transparency log with an external verifier).
 - Physical deployments still require independent local interlocks and domain-specific safe-failure behavior.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the contract, adapter boundary and implementation roadmap. Retired prototype implementations are not part of the supported UPMP source distribution.
