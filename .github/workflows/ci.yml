@@ -1,0 +1,95 @@
+# UPMP continuous integration
+#
+# Runs the full test suite, standalone scenarios, and example smoke
+# tests on every push and pull request to main, across the supported
+# Python version range (>=3.9 per setup.py).
+#
+# Scope: this workflow validates UPMP core (pure stdlib, no install_requires).
+# It does NOT run network or external-service tests (UPMP has none in-tree).
+# Subprocess crash tests (tests/test_audit_crash.py) run as part of the
+# pytest suite — they spawn a child Python process via sys.executable, which
+# is the same interpreter selected by setup-python.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # UPMP declares python_requires=">=3.9" (setup.py). The matrix
+        # covers every supported minor version on Ubuntu; 3.9 is also
+        # tested on Windows and macOS to catch platform-specific issues
+        # (e.g. fsync-on-directory semantics, newline handling).
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        os: [ubuntu-latest]
+        include:
+          - python-version: "3.9"
+            os: windows-latest
+          - python-version: "3.9"
+            os: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: setup.py
+
+      - name: Install package (editable)
+        # Editable install so `import UPMP` resolves to the working tree.
+        run: python -m pip install --upgrade pip && python -m pip install -e . pytest
+
+      - name: Show environment
+        run: |
+          python --version
+          python -c "import sys; print(sys.executable)"
+          python -c "import UPMP; print('UPMP', UPMP.__version__)"
+
+      - name: Run pytest suite
+        # Includes unit tests, audit storage tests, audit integration tests,
+        # SQLite tests, and the subprocess crash recovery test.
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: Run standalone scenario suite
+        # tests/test_scenarios.py is NOT pytest-collectible (its scenario_*
+        # functions don't match the test_* prefix); it must be invoked directly.
+        run: python tests/test_scenarios.py
+
+      - name: Smoke-test examples
+        # Both examples should exit 0 on a clean install.
+        run: |
+          python examples/closed_loop_simulation.py
+          python examples/quick_start.py
+
+  lint:
+    # Lightweight static check: compile every Python source file to catch
+    # syntax errors and obvious issues that would only surface at import
+    # time on a non-tested path. Not a substitute for proper linting, but
+    # catches the most embarrassing regressions cheaply.
+    name: Compile all sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile-check all Python files
+        run: |
+          python -m compileall -q UPMP tests examples scripts
+          python -c "import ast, pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('.').rglob('*.py')]"
