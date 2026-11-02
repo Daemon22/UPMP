@@ -417,11 +417,15 @@ def _step_outcome(events: Sequence[Any],
             status = _status_value(details.get("status", "indeterminate"))
             if status == "pass":
                 event_index = _event_index(events, event)
-                action_passed = any(
-                    _event_name(candidate) == "action_succeeded"
+                prior_actions = [
+                    candidate for candidate in events
+                    if _event_name(candidate) in (
+                        "action_succeeded", "action_failed",
+                        "action_denied", "action_indeterminate")
                     and _event_index(events, candidate) < event_index
-                    for candidate in events
-                )
+                ]
+                action_passed = bool(prior_actions) and (
+                    _event_name(prior_actions[-1]) == "action_succeeded")
                 return StepOutcome.COMPLETED if action_passed else StepOutcome.UNKNOWN
             return StepOutcome.FAILED if status == "fail" else StepOutcome.INDETERMINATE
         if name == "precondition_verified":
@@ -466,6 +470,8 @@ def _verification_issue(code: DiagnosticCode, stage: str, step_id: str,
 
 def _verification_message(stage: str, status: str, details: Mapping[str, Any]) -> str:
     findings = details.get("findings", ())
+    if not isinstance(findings, (list, tuple)):
+        findings = ()
     failed = [finding for finding in findings
               if isinstance(finding, Mapping)
               and _status_value(finding.get("status", "pass")) != "pass"]
