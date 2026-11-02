@@ -80,8 +80,9 @@ diagnostic helper to turn that evidence into a concise report:
 
 The report identifies observed steps, their outcome and attempts, the failed
 precondition/action/postcondition or unmet dependency, relevant evidence, and
-a suggested next check. It works with sequential and parallel results. It
-does not dispatch repairs or claim a root cause that the evidence cannot show.
+a suggested next check. It works with sequential and parallel results, whether
+actions use local handlers or optional adapters. It does not dispatch repairs
+or claim a root cause that the evidence cannot show.
 
 Run a self-contained example with:
 
