@@ -8,7 +8,7 @@ repairs or claim to prove a root cause.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
@@ -64,11 +64,7 @@ class WorkflowIssue:
     recommendation: str
     step_id: Optional[str] = None
     branch_id: Optional[str] = None
-    evidence: Mapping[str, Any] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.evidence is None:
-            object.__setattr__(self, "evidence", {})
+    evidence: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Mapping[str, Any]:
         return {
