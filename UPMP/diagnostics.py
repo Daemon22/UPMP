@@ -371,8 +371,6 @@ def _diagnose_step(step_id: str, branch_id: str, events: Sequence[Any]) -> StepD
         ))
 
     has_action_success = any(_event_name(event) == "action_succeeded" for event in action_events)
-    has_postcondition_pass = any(
-        _status_value(_details(event).get("status")) == "pass" for event in postcondition_events)
     if has_action_success and not postcondition_events and not any(
             issue.code == DiagnosticCode.POSTCONDITION_UNVERIFIED for issue in issues):
         event = next(event for event in reversed(action_events)
@@ -432,7 +430,7 @@ def _step_outcome(events: Sequence[Any],
                 return StepOutcome.FAILED
             if status == "indeterminate":
                 return StepOutcome.BLOCKED
-            return StepOutcome.INDETERMINATE
+            return StepOutcome.UNKNOWN
         if name == "action_failed":
             return StepOutcome.FAILED
         if name == "action_denied" or name == "dispatch_blocked":
