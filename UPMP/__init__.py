@@ -1,5 +1,5 @@
 """
-UPMP — Universal Progress Monitoring Package
+UPMP — Universal Process Monitoring Package
 ==============================================
 A domain-independent architectural framework for monitoring, verifying, and
 insuring the integrity of any complex process.
@@ -43,7 +43,7 @@ Usage:
     print(report.summary())
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 __author__ = "UPMP Framework"
 __license__ = "MIT"
 
@@ -129,6 +129,11 @@ from .closed_loop import (
     AuthorizationCheck,
 )
 
+from .diagnostics import (
+    DiagnosticCode, DiagnosticSeverity, StepOutcome, StepDiagnosis,
+    WorkflowIssue, WorkflowDiagnosis, diagnose_workflow,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -166,5 +171,8 @@ __all__ = [
     "VerificationPolicy", "ActionStatus", "RunStatus", "ActionRequest",
     "ActionResult", "WorkflowStep", "AuditEvent", "WorkflowResult",
     "ActionDispatcher", "ClosedLoopOrchestrator", "AuthorizationCheck",
+    # Step-by-step workflow diagnosis
+    "DiagnosticCode", "DiagnosticSeverity", "StepOutcome", "StepDiagnosis",
+    "WorkflowIssue", "WorkflowDiagnosis", "diagnose_workflow",
 ]
 
