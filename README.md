@@ -1,6 +1,6 @@
 # UPMP — Universal Process Monitoring Package
 
-**Version 2.3.0** | MIT License
+**Version 2.4.0** | MIT License
 
 UPMP provides domain-neutral building blocks for process integrity: state observation, verification against explicit criteria, risk and recovery handling, and workflow orchestration. It supports adapters for software, services, agents and equipment while keeping domain-specific sensors, policies and actions outside the core.
 
@@ -67,6 +67,26 @@ python examples/closed_loop_simulation.py
 
 The simulation switches to a simulated generator when mains power is unavailable, then verifies the pump state. It has no hardware access.
 
+## Find the step that needs attention
+
+The workflow result contains the step-by-step audit trail. Use the standalone
+diagnostic helper to turn that evidence into a concise report:
+
+    from UPMP import diagnose_workflow
+
+    diagnosis = diagnose_workflow(result)
+    print(diagnosis.format_report())
+    report_data = diagnosis.to_dict()
+
+The report identifies observed steps, their outcome and attempts, the failed
+precondition/action/postcondition or unmet dependency, relevant evidence, and
+a suggested next check. It works with sequential and parallel results. It
+does not dispatch repairs or claim a root cause that the evidence cannot show.
+
+Run a self-contained example with:
+
+    python examples/diagnose_workflow.py
+
 ## External security boundary
 
 Credential storage, encryption, compression, logins and identity management belong to the separate security service. UPMP accepts an optional authorization callback at action dispatch and an opaque `principal_ref`; it does not accept or store passwords, API keys, encryption keys or tokens. The callback is the seam for the external authorization engine.
@@ -104,8 +124,9 @@ Full threat model and remaining limitations are documented in the
 ## Current limits
 
 - The numeric `MonitoringEngine` scores are heuristics. The typed `VerificationPolicy` is the hard pass/fail/indeterminate path.
-- The workflow runtime is in-process. Action handlers run synchronously. Durable, hash-chained audit storage **is** provided (`FileAuditSink`, `SQLiteAuditSink`) with a checkpoint mechanism for terminal-event authentication; **safe cancellation and timeout guarantees are still not provided** (deferred to M2).
-- A handler must enforce idempotency for retried actions. The runtime reuses the idempotency key but cannot enforce external deduplication (deferred to M3).
+- Handlers run in-process by default. Run cancellation and deadlines are cooperative in the core, and per-step timeout detection is post-hoc. Optional thread and process preemptible dispatchers have different limits: threads cannot be killed, while process handlers must be picklable top-level functions. Neither can undo external side effects already started.
+- Retries require a step declared idempotent. An optional idempotency store can deduplicate action/key dispatches; without a configured store, the handler must handle external deduplication.
+- Durable, hash-chained audit storage is provided (`FileAuditSink`, `SQLiteAuditSink`) with a checkpoint mechanism for terminal-event authentication.
 - Audit storage is crash-durable but **not** tamper-proof against an attacker with write access to the storage file or database. Tamper **detection** is provided by the hash chain and the checkpoint mechanism; tamper **prevention** requires external controls (OS-level append-only flags, WORM storage, or a transparency log with an external verifier).
 - Physical deployments still require independent local interlocks and domain-specific safe-failure behavior.
 
