@@ -51,6 +51,7 @@ class DiagnosticCode(str, Enum):
     WORKFLOW_FAILED = "workflow_failed"
     WORKFLOW_BLOCKED = "workflow_blocked"
     NO_STEP_EVIDENCE = "no_step_evidence"
+    STEP_OUTCOME_UNVERIFIED = "step_outcome_unverified"
 
 
 @dataclass(frozen=True)
@@ -257,12 +258,18 @@ def _diagnose_step(step_id: str, branch_id: str, events: Sequence[Any]) -> StepD
             continue
         details = _details(event)
         if name == "action_failed":
+            failure_index = _event_index(events, event)
             recovered = any(
                 _event_name(candidate) == "action_succeeded"
-                and _event_index(events, candidate) > _event_index(events, event)
+                and _event_index(events, candidate) > failure_index
+                and any(
+                    _event_name(verified) == "postcondition_verified"
+                    and _status_value(_details(verified).get("status")) == "pass"
+                    and _event_index(events, verified) > _event_index(events, candidate)
+                    for verified in postcondition_events
+                )
                 for candidate in action_events
-            ) and any(_status_value(_details(candidate).get("status")) == "pass"
-                      for candidate in postcondition_events)
+            )
             message = str(details.get("message") or "The action handler failed.")
             if recovered:
                 message += " A later attempt passed postcondition verification."
@@ -296,7 +303,22 @@ def _diagnose_step(step_id: str, branch_id: str, events: Sequence[Any]) -> StepD
         if status != "pass":
             code = (DiagnosticCode.POSTCONDITION_FAILED if status == "fail"
                     else DiagnosticCode.POSTCONDITION_INDETERMINATE)
-            issues.append(_verification_issue(code, "postcondition", step_id, branch_id, event))
+            event_index = _event_index(events, event)
+            recovered = any(
+                _status_value(_details(candidate).get("status")) == "pass"
+                and _event_index(events, candidate) > event_index
+                for candidate in postcondition_events
+            )
+            severity = DiagnosticSeverity.WARNING if recovered else DiagnosticSeverity.ERROR
+            issue = _verification_issue(code, "postcondition", step_id, branch_id, event, severity)
+            if recovered:
+                issue = WorkflowIssue(
+                    issue.code, issue.severity, issue.stage,
+                    issue.message + " A later verification passed.",
+                    "Review the earlier failure; the step later passed verification.",
+                    issue.step_id, issue.branch_id, issue.evidence,
+                )
+            issues.append(issue)
 
     if any(_event_name(event) == "dispatch_blocked" for event in events) and not any(
             issue.code in (DiagnosticCode.PRECONDITION_FAILED,
@@ -362,12 +384,20 @@ def _diagnose_step(step_id: str, branch_id: str, events: Sequence[Any]) -> StepD
             step_id, branch_id, _event_evidence(event),
         ))
 
-    outcome = _step_outcome(events, issues, has_postcondition_pass)
+    outcome = _step_outcome(events, issues)
+    if outcome == StepOutcome.UNKNOWN and not any(
+            issue.code == DiagnosticCode.STEP_OUTCOME_UNVERIFIED for issue in issues):
+        issues.append(_issue(
+            DiagnosticCode.STEP_OUTCOME_UNVERIFIED, DiagnosticSeverity.WARNING, "evidence",
+            "The audit trail does not establish a final outcome for this step.",
+            "Inspect the complete audit trail and the step handler's returned result before treating it as complete.",
+            step_id, branch_id, {},
+        ))
     return StepDiagnosis(step_id, branch_id, action, outcome, attempts, tuple(issues))
 
 
-def _step_outcome(events: Sequence[Any], issues: Sequence[WorkflowIssue],
-                  postcondition_passed: bool) -> StepOutcome:
+def _step_outcome(events: Sequence[Any],
+                  issues: Sequence[WorkflowIssue]) -> StepOutcome:
     terminals = [event for event in events if _event_name(event) in (
         "step_completed", "step_failed", "step_skipped", "step_cancelled")]
     if terminals:
@@ -379,30 +409,48 @@ def _step_outcome(events: Sequence[Any], issues: Sequence[WorkflowIssue],
         if name == "step_skipped":
             return StepOutcome.SKIPPED
         return StepOutcome.CANCELLED
-    if any(_event_name(event) == "scheduled" for event in events):
-        return StepOutcome.SCHEDULED
-    if postcondition_passed:
-        return StepOutcome.COMPLETED
+
+    for event in reversed(events):
+        name = _event_name(event)
+        details = _details(event)
+        if name == "scheduled":
+            return StepOutcome.SCHEDULED
+        if name == "postcondition_verified":
+            status = _status_value(details.get("status", "indeterminate"))
+            if status == "pass":
+                event_index = _event_index(events, event)
+                action_passed = any(
+                    _event_name(candidate) == "action_succeeded"
+                    and _event_index(events, candidate) < event_index
+                    for candidate in events
+                )
+                return StepOutcome.COMPLETED if action_passed else StepOutcome.UNKNOWN
+            return StepOutcome.FAILED if status == "fail" else StepOutcome.INDETERMINATE
+        if name == "precondition_verified":
+            status = _status_value(details.get("status", "indeterminate"))
+            if status == "fail":
+                return StepOutcome.FAILED
+            if status == "indeterminate":
+                return StepOutcome.BLOCKED
+            return StepOutcome.INDETERMINATE
+        if name == "action_failed":
+            return StepOutcome.FAILED
+        if name == "action_denied" or name == "dispatch_blocked":
+            return StepOutcome.BLOCKED
+        if name == "action_indeterminate":
+            return StepOutcome.INDETERMINATE
+        if name == "action_succeeded":
+            return StepOutcome.INDETERMINATE
+
     codes = {issue.code for issue in issues}
-    if codes.intersection({DiagnosticCode.PRECONDITION_FAILED, DiagnosticCode.ACTION_FAILED,
-                           DiagnosticCode.POSTCONDITION_FAILED}):
-        return StepOutcome.FAILED
-    if codes.intersection({DiagnosticCode.PRECONDITION_INDETERMINATE,
-                           DiagnosticCode.ACTION_DENIED, DiagnosticCode.DISPATCH_BLOCKED}):
-        return StepOutcome.BLOCKED
-    if codes.intersection({DiagnosticCode.ACTION_INDETERMINATE,
-                           DiagnosticCode.POSTCONDITION_INDETERMINATE,
-                           DiagnosticCode.POSTCONDITION_UNVERIFIED}):
-        return StepOutcome.INDETERMINATE
-    if any(_event_name(event) == "action_succeeded" for event in events):
-        return StepOutcome.INDETERMINATE
-    if any(_event_name(event) == "action_failed" for event in events):
-        return StepOutcome.FAILED
+    if DiagnosticCode.DEPENDENCY_NOT_SATISFIED in codes:
+        return StepOutcome.SKIPPED
     return StepOutcome.UNKNOWN
 
 
 def _verification_issue(code: DiagnosticCode, stage: str, step_id: str,
-                        branch_id: str, event: Any) -> WorkflowIssue:
+                        branch_id: str, event: Any,
+                        severity: DiagnosticSeverity = DiagnosticSeverity.ERROR) -> WorkflowIssue:
     details = _details(event)
     status = _status_value(details.get("status", "indeterminate"))
     message = _verification_message(stage, status, details)
@@ -414,7 +462,7 @@ def _verification_issue(code: DiagnosticCode, stage: str, step_id: str,
         recommendation = "Inspect the action output and actual state; the required outcome was not verified."
     else:
         recommendation = "Check whether required post-action observations are missing, stale, invalid, or using the wrong unit."
-    return _issue(code, DiagnosticSeverity.ERROR, stage, message, recommendation,
+    return _issue(code, severity, stage, message, recommendation,
                   step_id, branch_id, _event_evidence(event))
 
 
