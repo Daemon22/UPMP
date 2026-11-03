@@ -88,6 +88,98 @@ Run a self-contained example with:
 
     python examples/diagnose_workflow.py
 
+## Reuse a process map and hand off a precise slice
+
+UPMP can work alone as the process charter, live monitor, verifier, audit trail,
+and point of escalation. An adapter supplies the process map and the connected
+tools do the actual work. Every connection in the map must come from a declared
+dependency/route or from recorded execution evidence; an adapter should leave
+unknown paths unknown.
+
+The graph API can represent workflow steps, application screens, repository
+components, or other connected items. Attach stable source
+references to nodes so a paired tool can resolve the exact part it owns:
+
+```python
+from UPMP.flow_graph import FlowCatalog, workflow_flow_graph
+
+graph = workflow_flow_graph(
+    steps,
+    audit=result.audit,
+    node_details_by_id={
+        "payment": {
+            "resource_refs": ["src/checkout/payment.py#PaymentStep"],
+        },
+    },
+    entry_step_ids=("start",),
+)
+catalog = FlowCatalog()
+catalog.register(
+    "checkout",
+    graph,
+    metadata={"revision": "the source revision mapped by the adapter"},
+)
+catalog.save("process-map.json")
+
+# A paired tool can load the saved map and request only this node's neighbors.
+scope = FlowCatalog.load("process-map.json").select(
+    "checkout",
+    resource_ref="src/checkout/payment.py#PaymentStep",
+    direction="both",
+    max_depth=1,
+)
+handoff = scope.to_dict()
+```
+
+The selected slice includes its exact node IDs, nearby declared paths, and
+boundary connections back to the rest of the process. A tool can use that
+handoff to edit or inspect one component without rebuilding the whole map.
+Afterward, UPMP can verify the tool's result against the step's postconditions
+and record the route actually taken. A workflow can route failed or unverifiable
+results to its configured user-contact step and wait for direction. The adapter
+owns map freshness and source references; UPMP does not claim to discover
+application behavior it has not observed or been given.
+
+Applications have a dedicated screen and navigation adapter. An app connector
+provides declared screens and routes, then passes observed navigation and the
+current screen. UPMP highlights matched paths. If the app visits an undeclared
+route or screen, the map shows an indeterminate route or screen so the missing
+map entry can be reviewed:
+
+```python
+from UPMP import (
+    ApplicationNavigation,
+    ApplicationScreen,
+    ApplicationTransition,
+    application_flow_graph,
+)
+
+app_graph = application_flow_graph(
+    screens=[
+        ApplicationScreen("home", "Home", "/", resource_refs=["src/home.py#Home"]),
+        ApplicationScreen("search", "Search", "/search"),
+        ApplicationScreen("account", "Account", "/account"),
+        ApplicationScreen("summary", "Summary", "/summary"),
+    ],
+    transitions=[
+        ApplicationTransition("home", "search", "Search link", "home-search"),
+        ApplicationTransition("home", "account", "Account link", "home-account"),
+        ApplicationTransition("search", "summary", "Open summary", "search-summary"),
+        ApplicationTransition("account", "summary", "Return to summary", "account-summary"),
+    ],
+    observed_navigation=browser_adapter.navigation_events,
+    current_screen_id=browser_adapter.current_screen_id,
+    entry_screen_ids=("home",),
+    exit_screen_ids=("summary",),
+)
+```
+
+Here the declared screen map shows both routes and their shared destination;
+the connector's navigation events identify which path the app took. The
+`browser_adapter` name represents an app-specific connector that supplies
+screen IDs and navigation evidence; UPMP does not discover arbitrary app
+routes without one.
+
 ## External security boundary
 
 Credential storage, encryption, compression, logins and identity management belong to the separate security service. UPMP accepts an optional authorization callback at action dispatch and an opaque `principal_ref`; it does not accept or store passwords, API keys, encryption keys or tokens. The callback is the seam for the external authorization engine.

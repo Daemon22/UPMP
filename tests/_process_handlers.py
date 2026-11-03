@@ -36,6 +36,18 @@ def raising_handler(request, state):
     raise RuntimeError("boom from process handler")
 
 
+def recover_handler(request, state):
+    """Module-level recovery action for spawn-based dispatch tests."""
+    return ActionResult(
+        ActionStatus.SUCCEEDED,
+        "recovered",
+        replace(state, observations={
+            **state.observations,
+            "done": Observation(True, source="result"),
+        }),
+    )
+
+
 def _global_counter():
     """Helper — returns a counter that increments on each call.
     Used to verify the handler actually ran in the child process."""

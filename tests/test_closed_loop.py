@@ -1,6 +1,7 @@
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from UPMP import (
     ActionDispatcher, ActionResult, ActionStatus, ClosedLoopOrchestrator,
@@ -102,6 +103,35 @@ class VerificationTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_postcondition_uses_action_completion_time(self):
+        start = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        initial = ProcessState("test.domain", "1", {
+            "ready": Observation(True, start.isoformat(), source="test"),
+        })
+        dispatcher = ActionDispatcher({"act"})
+
+        def act(req, current):
+            values = dict(current.observations)
+            values["done"] = Observation(
+                True, (start + timedelta(seconds=10)).isoformat(), source="action-result")
+            return ActionResult(
+                ActionStatus.SUCCEEDED, "completed after ten seconds",
+                replace(current, observations=values),
+            )
+
+        dispatcher.register("act", act)
+        step = WorkflowStep(
+            "act_step", "act",
+            policy("pre", Constraint("ready", "eq", True)),
+            policy("post", Constraint("done", "eq", True)),
+        )
+        with patch("UPMP.closed_loop.time") as mocked_time:
+            mocked_time.monotonic.side_effect = (0.0, 10.0)
+            result = ClosedLoopOrchestrator([step], dispatcher).run(initial, now=start)
+
+        self.assertEqual(result.status, RunStatus.COMPLETED)
+        self.assertEqual(result.audit[-1].details["status"], "pass")
+
     def test_closed_loop_success_and_observe_each_action(self):
         dispatcher = ActionDispatcher({"generator", "pump"})
         calls = []
@@ -128,6 +158,11 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(result.status, RunStatus.COMPLETED)
         self.assertEqual(calls, ["generator", "pump"])
         self.assertEqual(sum(event.event == "postcondition_verified" for event in result.audit), 2)
+        transitions = [event.details for event in result.audit
+                       if event.event == "branch_transition"]
+        self.assertEqual(transitions, [{
+            "from": "backup", "to": "irrigate", "via": "on_success",
+        }])
 
     def test_failed_precondition_blocks_action(self):
         dispatcher = ActionDispatcher({"act"})

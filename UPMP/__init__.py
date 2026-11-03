@@ -133,6 +133,12 @@ from .diagnostics import (
     DiagnosticCode, DiagnosticSeverity, StepOutcome, StepDiagnosis,
     WorkflowIssue, WorkflowDiagnosis, diagnose_workflow,
 )
+from .flow_graph import (
+    ApplicationNavigation, ApplicationScreen, ApplicationTransition,
+    FlowCatalog, FlowEdge, FlowGraph, FlowNode, FlowScope,
+    application_flow_graph, build_flow_graph, flow_scope,
+    layout_flow_graph, workflow_flow_graph,
+)
 
 __all__ = [
     # Version
@@ -174,5 +180,10 @@ __all__ = [
     # Step-by-step workflow diagnosis
     "DiagnosticCode", "DiagnosticSeverity", "StepOutcome", "StepDiagnosis",
     "WorkflowIssue", "WorkflowDiagnosis", "diagnose_workflow",
+    # Process and application flow maps
+    "ApplicationNavigation", "ApplicationScreen", "ApplicationTransition",
+    "FlowCatalog", "FlowEdge", "FlowGraph", "FlowNode", "FlowScope",
+    "application_flow_graph", "build_flow_graph", "flow_scope",
+    "layout_flow_graph", "workflow_flow_graph",
 ]
 

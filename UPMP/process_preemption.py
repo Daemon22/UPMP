@@ -1,103 +1,168 @@
-"""Process-level preemption for UPMP — true handler termination via SIGKILL.
+"""Process-level preemption with import-resolved handlers.
 
-M2.3 scope — provides preemption that actually TERMINATES the handler,
-unlike M2.2's thread-based preemption which leaves orphaned daemon
-threads running. Each dispatch() runs the handler in a child process;
-if the timeout expires, the parent sends SIGTERM (then SIGKILL if
-needed) to the child, guaranteeing the handler is dead before the
-dispatcher returns.
-
-Trade-off vs M2.2 (PreemptibleDispatcher, thread-based):
-  + The handler is actually killed — no orphaned threads consuming
-    resources after preemption.
-  + A hung handler cannot affect subsequent dispatches (each gets a
-    fresh process).
-  - The handler MUST be a picklable top-level function. Lambdas and
-    closures are NOT picklable and will raise at dispatch time.
-    (On fork-start-method platforms, this is relaxed — but on Windows
-    / spawn, the handler must be importable by the child process.)
-  - ProcessState and ActionResult must be picklable. They are frozen
-    dataclasses; values (Observation.value) must also be picklable.
-  - Subprocess overhead: ~5-50ms per dispatch (process spawn), vs
-    ~0.05ms for a thread. Not suitable for high-throughput use.
-  - The child process inherits the parent's memory at fork time; large
-    parent state can make spawning expensive.
-
-Threat model notes (see THREAT.md):
-  - Process isolation means a handler that crashes (segfault, OOM,
-    infinite loop) cannot corrupt the parent's state. The dispatcher
-    returns FAILED or INDETERMINATE and the parent continues.
-  - The child process does NOT share the parent's audit sink, audit
-    events, or in-memory state. Only the dispatch result is sent back
-    via the Queue. This is by design — process isolation is the point.
-  - On non-fork platforms (Windows spawn), the child re-imports the
-    module containing the handler. Module-level side effects run twice.
-    Keep module top-level code side-effect-free.
-
-Backward compatibility:
-  - Pure addition. PreemptibleDispatcher (M2.2) is unchanged. Callers
-    choose between thread-based (any callable, soft preemption) and
-    process-based (picklable handlers only, hard preemption).
+Timed dispatches run in a small, reusable worker process. The worker receives
+only a handler import reference, the action and picklable request fields, and
+the process state. Authorization, idempotency, cancellation, and timeout
+enforcement remain in the parent process.
 """
 from __future__ import annotations
 
-import multiprocessing
+import atexit
+import importlib
+import inspect
 import os
-import signal
+import pickle
+import subprocess
+import sys
+import threading
 import time
-from typing import Any, Optional, Union
-from queue import Empty as QueueEmpty
+from typing import Any, Optional
 
 from .closed_loop import ActionDispatcher, ActionRequest, ActionResult, ActionStatus, ProcessState
 
 
-# Module-level worker function. Must be top-level (not a closure) so
-# it is picklable for spawn start method. The wrapped dispatcher and
-# the request/state are passed as arguments (they must also be picklable).
-def _process_worker(dispatcher: ActionDispatcher,
-                    request: ActionRequest,
-                    state: ProcessState,
-                    result_queue: multiprocessing.Queue) -> None:
-    """Run the dispatcher's dispatch in a child process. Puts the
-    result (or the exception) on the queue. Does NOT catch exceptions
-    from the dispatcher itself — ActionDispatcher.dispatch already
-    catches handler exceptions and returns FAILED. We only catch
-    pickling errors on the queue.put."""
-    try:
-        result = dispatcher.dispatch(request, state)
-        result_queue.put(("result", result))
-    except BaseException as exc:
-        # Shouldn't happen (ActionDispatcher.dispatch catches handler
-        # exceptions), but just in case — send the exception back so
-        # the parent can return FAILED instead of hanging.
+_FRAME_SIZE_BYTES = 8
+_WORKER_READY = b"R"
+_WORKER_PROCESSES = set()
+_WORKER_PROCESSES_LOCK = threading.Lock()
+
+
+def _resolve_handler(handler_reference: str) -> Any:
+    """Import ``module:qualified_name`` and return its callable target."""
+    module_name, separator, qualified_name = handler_reference.partition(":")
+    if not separator or not module_name or not qualified_name:
+        raise ImportError("invalid handler import reference")
+    module = importlib.import_module(module_name)
+    handler = module
+    for attribute in qualified_name.split("."):
+        handler = getattr(handler, attribute)
+    if not callable(handler):
+        raise TypeError("imported handler is not callable")
+    return handler
+
+
+def _read_exact(stream: Any, count: int) -> bytes:
+    chunks = []
+    remaining = count
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise EOFError("worker pipe closed before the message was complete")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_frame(stream: Any, value: Any) -> None:
+    payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    stream.write(len(payload).to_bytes(_FRAME_SIZE_BYTES, "big"))
+    stream.write(payload)
+    stream.flush()
+
+
+def _read_frame(stream: Any) -> Any:
+    size = int.from_bytes(_read_exact(stream, _FRAME_SIZE_BYTES), "big")
+    return pickle.loads(_read_exact(stream, size))
+
+
+def _subprocess_worker() -> None:
+    """Serve request frames until the parent closes the input pipe."""
+    input_stream = sys.stdin.buffer
+    output_stream = sys.stdout.buffer
+    # User handlers may print; keep their output away from the framed IPC.
+    devnull = open(os.devnull, "w")
+    sys.stdout = devnull
+    sys.stderr = devnull
+    output_stream.write(_WORKER_READY)
+    output_stream.flush()
+
+    while True:
+        header = input_stream.read(_FRAME_SIZE_BYTES)
+        if not header:
+            break
         try:
-            result_queue.put(("exception", type(exc).__name__, str(exc)))
-        except Exception:
-            # Last resort: signal that something went wrong.
-            result_queue.put(("error", "unpicklable exception"))
+            size = int.from_bytes(header + _read_exact(input_stream, _FRAME_SIZE_BYTES - len(header)), "big")
+            message = pickle.loads(_read_exact(input_stream, size))
+            handler = _resolve_handler(message["handler_reference"])
+            request_fields = message["request_fields"]
+            request = ActionRequest(
+                action=message["action"],
+                parameters=request_fields["parameters"],
+                principal_ref=request_fields["principal_ref"],
+                request_id=request_fields["request_id"],
+                idempotency_key=request_fields["idempotency_key"],
+            )
+            try:
+                result = handler(request, message["state"])
+                if not isinstance(result, ActionResult):
+                    result = ActionResult(
+                        ActionStatus.INDETERMINATE,
+                        "handler returned an invalid result",
+                    )
+                response = ("result", result)
+            except Exception as exc:
+                response = (
+                    "error",
+                    "action handler raised %s: %s" % (type(exc).__name__, exc),
+                )
+        except Exception as exc:
+            response = (
+                "error",
+                "child could not import or run handler: %s: %s"
+                % (type(exc).__name__, exc),
+            )
+
+        try:
+            _write_frame(output_stream, response)
+        except Exception as exc:
+            # A result may contain an unpicklable object. Send a plain-text
+            # failure instead so the parent never mistakes it for a hang.
+            try:
+                _write_frame(
+                    output_stream,
+                    ("error", "handler result could not be serialized: %s: %s"
+                     % (type(exc).__name__, exc)),
+                )
+            except Exception:
+                break
+    devnull.close()
+
+
+def _cleanup_workers() -> None:
+    with _WORKER_PROCESSES_LOCK:
+        workers = list(_WORKER_PROCESSES)
+        _WORKER_PROCESSES.clear()
+    for process in workers:
+        _stop_process(process, 0.2)
+
+
+def _stop_process(process: subprocess.Popen, grace_seconds: float) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=grace_seconds or 0.1)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    with _WORKER_PROCESSES_LOCK:
+        _WORKER_PROCESSES.discard(process)
+
+
+atexit.register(_cleanup_workers)
 
 
 class ProcessPreemptibleDispatcher:
-    """Wraps an ActionDispatcher with process-based handler preemption.
+    """Run registered module-level handlers in a killable worker process.
 
-    Each dispatch() spawns a fresh child process that runs the wrapped
-    dispatcher's dispatch. The parent waits up to default_timeout_seconds
-    for the result; if the timeout expires, the parent terminates the
-    child (SIGTERM, then SIGKILL if needed) and returns INDETERMINATE.
-
-    Unlike PreemptibleDispatcher (M2.2, thread-based), the handler is
-    actually KILLED — no orphaned threads. The trade-off is that the
-    handler must be a picklable top-level function (no lambdas or
-    closures), and there is subprocess overhead per dispatch.
-
-    Usage:
-        base = ActionDispatcher({"act"})
-        base.register("act", my_top_level_handler)  # NOT a lambda
-        preemptible = ProcessPreemptibleDispatcher(base, default_timeout_seconds=0.5)
-        orchestrator = ClosedLoopOrchestrator(steps, preemptible, ...)
-
-    The wrapper forwards register() and standard dispatcher attributes
-    so the orchestrator can treat it like an ActionDispatcher.
+    The parent keeps authorization, idempotency, cancellation and timeout
+    control. Timed handlers must be importable functions defined at module
+    scope. Lambdas, closures and bound methods return FAILED without running.
     """
 
     def __init__(self, dispatcher: ActionDispatcher,
@@ -110,15 +175,14 @@ class ProcessPreemptibleDispatcher:
         self._dispatcher = dispatcher
         self.default_timeout_seconds = default_timeout_seconds
         self.kill_grace_seconds = kill_grace_seconds
-
-    # ---- forwarded API ----
+        self._worker: Optional[subprocess.Popen] = None
+        self._worker_error: Optional[str] = None
+        self._worker_lock = threading.RLock()
+        if default_timeout_seconds is not None:
+            self._start_worker()
 
     def register(self, name: str, handler: Any) -> None:
-        """Register a handler on the wrapped dispatcher.
-
-        The handler MUST be a picklable top-level function for
-        process-based dispatch to work. Lambdas and closures will
-        raise PicklingError at dispatch time."""
+        """Register a handler on the wrapped dispatcher."""
         self._dispatcher.register(name, handler)
 
     @property
@@ -138,100 +202,246 @@ class ProcessPreemptibleDispatcher:
         """The underlying dispatcher (for direct access if needed)."""
         return self._dispatcher
 
-    # ---- process-based preemption logic ----
+    def _cache_result(self, request: ActionRequest, result: ActionResult) -> ActionResult:
+        store = self.idempotency_store
+        if store is not None and request.idempotency_key:
+            store.put(request.action, request.idempotency_key, result)
+        return result
+
+    @staticmethod
+    def _handler_reference(handler: Any) -> str:
+        if not inspect.isfunction(handler):
+            raise TypeError("handler must be an importable module-level function")
+        module_name = getattr(handler, "__module__", "")
+        qualified_name = getattr(handler, "__qualname__", "")
+        if (not module_name or module_name in ("__main__", "__mp_main__")
+                or not qualified_name or "<locals>" in qualified_name
+                or "<lambda>" in qualified_name):
+            raise TypeError("handler must be an importable module-level function")
+        return "%s:%s" % (module_name, qualified_name)
+
+    def _start_worker(self) -> bool:
+        if self._worker is not None and self._worker.poll() is None:
+            return True
+        self._worker = None
+        self._worker_error = None
+        package_path = os.path.dirname(os.path.abspath(__file__))
+        package_parent = os.path.dirname(package_path)
+        environment = os.environ.copy()
+        search_path = list(dict.fromkeys(path for path in sys.path if path))
+        inherited_path = environment.get("PYTHONPATH")
+        if inherited_path:
+            search_path.extend(path for path in inherited_path.split(os.pathsep)
+                               if path and path not in search_path)
+        if search_path:
+            environment["PYTHONPATH"] = os.pathsep.join(search_path)
+        bootstrap = (
+            "import sys,types;"
+            "root=sys.argv[1];"
+            "package=types.ModuleType('UPMP');"
+            "package.__path__=[root];"
+            "sys.modules['UPMP']=package;"
+            "from UPMP.process_preemption import _subprocess_worker;"
+            "_subprocess_worker()"
+        )
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-c", bootstrap, package_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+                cwd=package_parent,
+                env=environment,
+            )
+            ready = []
+            ready_event = threading.Event()
+
+            def read_ready() -> None:
+                try:
+                    ready.append(process.stdout.read(1))
+                except (OSError, ValueError):
+                    ready.append(b"")
+                finally:
+                    ready_event.set()
+
+            threading.Thread(target=read_ready, daemon=True).start()
+            if not ready_event.wait(30) or ready != [_WORKER_READY]:
+                _stop_process(process, self.kill_grace_seconds)
+                self._worker_error = "worker did not initialize or could not import UPMP"
+                return False
+            self._worker = process
+            with _WORKER_PROCESSES_LOCK:
+                _WORKER_PROCESSES.add(process)
+            return True
+        except (OSError, ValueError) as exc:
+            self._worker_error = "could not start worker process: %s: %s" % (
+                type(exc).__name__, exc,
+            )
+            return False
+
+    def _discard_worker(self) -> None:
+        process = self._worker
+        self._worker = None
+        if process is not None:
+            _stop_process(process, self.kill_grace_seconds)
+
+    def close(self) -> None:
+        """Stop and reap this dispatcher's worker process, if any."""
+        with self._worker_lock:
+            self._discard_worker()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def dispatch(self, request: ActionRequest, state: ProcessState,
                  timeout_seconds: Optional[float] = None) -> ActionResult:
-        """Dispatch with process-based preemption.
-
-        Args:
-            request: the action request. If request.cancellation_token
-                is already cancelled, returns INDETERMINATE immediately
-                without spawning a process.
-            state: the process state (must be picklable).
-            timeout_seconds: per-call override. If None, uses
-                default_timeout_seconds. If both are None, dispatches
-                synchronously (no preemption — backward compat).
-
-        Returns:
-            The handler's ActionResult, or INDETERMINATE if the handler
-            didn't return within the timeout (and was then killed).
-        """
-        # Pre-check: if the cancellation token is already set, don't
-        # spawn a process.
+        """Dispatch an action, enforcing timeout and cancellation in parent."""
         if request.cancellation_token.is_cancelled():
-            return ActionResult(ActionStatus.INDETERMINATE,
-                                "preempted: cancellation token already set")
+            return ActionResult(
+                ActionStatus.INDETERMINATE,
+                "preempted: cancellation token already set",
+            )
 
-        timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
-
-        # No timeout -> dispatch synchronously (backward compat).
-        # This avoids subprocess overhead when preemption isn't needed.
+        timeout = (timeout_seconds if timeout_seconds is not None
+                   else self.default_timeout_seconds)
         if timeout is None:
             return self._dispatcher.dispatch(request, state)
 
-        # Spawn a child process and wait with timeout.
-        ctx = multiprocessing.get_context("fork") if hasattr(os, "fork") else multiprocessing.get_context()
-        result_queue = ctx.Queue()
+        if (request.action not in self._dispatcher.allowed_actions
+                or request.action not in self._dispatcher._handlers):
+            return ActionResult(ActionStatus.DENIED, "action is not authorized")
+
+        store = self.idempotency_store
+        if store is not None and request.idempotency_key:
+            cached = store.get(request.action, request.idempotency_key)
+            if cached is not None:
+                return cached
+
+        authorize = self.authorize
+        if authorize is not None:
+            try:
+                if not authorize(request, state):
+                    return self._cache_result(
+                        request,
+                        ActionResult(ActionStatus.DENIED,
+                                     "external authorization policy denied action"),
+                    )
+            except Exception:
+                return self._cache_result(
+                    request,
+                    ActionResult(ActionStatus.DENIED,
+                                 "external authorization policy unavailable"),
+                )
 
         try:
-            process = ctx.Process(
-                target=_process_worker,
-                args=(self._dispatcher, request, state, result_queue),
-                daemon=True,
-                name="upmp-process-%s" % request.action,
+            handler_reference = self._handler_reference(
+                self._dispatcher._handlers[request.action]
             )
         except Exception as exc:
-            # Pickling the arguments failed (e.g., handler is a lambda).
-            return ActionResult(
-                ActionStatus.FAILED,
-                "could not spawn worker process: %s: %s (handler must be a picklable top-level function)"
-                % (type(exc).__name__, exc),
+            return self._cache_result(
+                request,
+                ActionResult(
+                    ActionStatus.FAILED,
+                    "could not resolve handler for child process: %s: %s"
+                    % (type(exc).__name__, exc),
+                ),
             )
 
-        process.start()
+        request_fields = {
+            "parameters": request.parameters,
+            "principal_ref": request.principal_ref,
+            "request_id": request.request_id,
+            "idempotency_key": request.idempotency_key,
+        }
         try:
-            kind, *rest = result_queue.get(timeout=timeout)
-        except QueueEmpty:
-            # Timeout — kill the child.
-            self._kill_process(process)
-            return ActionResult(
-                ActionStatus.INDETERMINATE,
-                "preempted after %.3fs (handler process killed)" % timeout,
+            payload = pickle.dumps({
+                "handler_reference": handler_reference,
+                "action": request.action,
+                "request_fields": request_fields,
+                "state": state,
+            }, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as exc:
+            self._discard_worker()
+            return self._cache_result(
+                request,
+                ActionResult(
+                    ActionStatus.FAILED,
+                    "worker request could not be serialized: %s: %s"
+                    % (type(exc).__name__, exc),
+                ),
             )
 
-        # Wait for the process to exit cleanly.
-        process.join(timeout=self.kill_grace_seconds)
-        if process.is_alive():
-            # The worker put the result but didn't exit — force kill.
-            self._kill_process(process)
-
-        if kind == "result":
-            return rest[0]
-        elif kind == "exception":
-            return ActionResult(
-                ActionStatus.FAILED,
-                "dispatch worker raised %s: %s" % (rest[0], rest[1]),
-            )
-        else:
-            return ActionResult(
-                ActionStatus.FAILED,
-                "dispatch worker reported an unpicklable error",
-            )
-
-    def _kill_process(self, process: multiprocessing.Process) -> None:
-        """Terminate the child process: SIGTERM, wait, SIGKILL if still alive."""
-        if not process.is_alive():
-            return
-        process.terminate()  # SIGTERM
-        process.join(timeout=self.kill_grace_seconds)
-        if process.is_alive():
+        with self._worker_lock:
+            if not self._start_worker():
+                return self._cache_result(
+                    request,
+                    ActionResult(
+                        ActionStatus.FAILED,
+                        self._worker_error or "could not start worker process",
+                    ),
+                )
+            process = self._worker
             try:
-                # SIGKILL — the process cannot catch this.
-                if hasattr(process, "kill"):
-                    process.kill()
-                else:
-                    os.kill(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            process.join(timeout=self.kill_grace_seconds)
+                assert process is not None and process.stdin is not None
+                process.stdin.write(len(payload).to_bytes(_FRAME_SIZE_BYTES, "big"))
+                process.stdin.write(payload)
+                process.stdin.flush()
+            except (OSError, ValueError) as exc:
+                self._discard_worker()
+                return self._cache_result(
+                    request,
+                    ActionResult(
+                        ActionStatus.FAILED,
+                        "could not send request to worker process: %s: %s"
+                        % (type(exc).__name__, exc),
+                    ),
+                )
+
+            response = []
+            response_event = threading.Event()
+
+            def read_response() -> None:
+                try:
+                    assert process is not None and process.stdout is not None
+                    response.append(_read_frame(process.stdout))
+                except Exception as exc:
+                    response.append(("error", "worker response could not be read: %s: %s"
+                                     % (type(exc).__name__, exc)))
+                finally:
+                    response_event.set()
+
+            threading.Thread(target=read_response, daemon=True).start()
+            deadline = time.monotonic() + timeout
+            while not response_event.is_set():
+                if request.cancellation_token.is_cancelled():
+                    self._discard_worker()
+                    return self._cache_result(
+                        request,
+                        ActionResult(
+                            ActionStatus.INDETERMINATE,
+                            "preempted: cancellation token set; handler process killed",
+                        ),
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._discard_worker()
+                    return self._cache_result(
+                        request,
+                        ActionResult(
+                            ActionStatus.INDETERMINATE,
+                            "preempted after %.3fs (handler process killed)" % timeout,
+                        ),
+                    )
+                response_event.wait(min(remaining, 0.02))
+
+            kind, result = response[0]
+            if kind == "result" and isinstance(result, ActionResult):
+                return self._cache_result(request, result)
+            return self._cache_result(
+                request,
+                ActionResult(ActionStatus.FAILED, str(result)),
+            )
