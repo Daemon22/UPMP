@@ -139,6 +139,7 @@ from .flow_graph import (
     application_flow_graph, build_flow_graph, flow_scope,
     layout_flow_graph, workflow_flow_graph,
 )
+from .craft_adapter import craft_progress_flow_graph, read_craft_progress_jsonl
 
 __all__ = [
     # Version
@@ -185,5 +186,7 @@ __all__ = [
     "FlowCatalog", "FlowEdge", "FlowGraph", "FlowNode", "FlowScope",
     "application_flow_graph", "build_flow_graph", "flow_scope",
     "layout_flow_graph", "workflow_flow_graph",
+    # CRAFT Engine progress stream integration
+    "craft_progress_flow_graph", "read_craft_progress_jsonl",
 ]
 

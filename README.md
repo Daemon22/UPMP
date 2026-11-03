@@ -180,6 +180,28 @@ the connector's navigation events identify which path the app took. The
 screen IDs and navigation evidence; UPMP does not discover arbitrary app
 routes without one.
 
+## Monitor Craft Engine operations
+
+Craft Engine's `nano` and `macro` operations can append a content-free JSONL
+progress stream. UPMP reads that stream into the actual pack or restore flow,
+including the metadata-encryption and self-verification branches, and marks
+the route recorded by the current run:
+
+```python
+from UPMP import craft_progress_flow_graph, read_craft_progress_jsonl
+
+events = read_craft_progress_jsonl("craft-progress.jsonl")
+graph = craft_progress_flow_graph(events)  # pass operation_id if the file has several runs
+catalog.register("craft-pack", graph)
+```
+
+Start the CRAFT CLI with `--events craft-progress.jsonl` to create the stream.
+The two integrations stay separate: CRAFT owns encryption and artifact
+creation, UPMP checks and maps its progress, Vault can own artifact storage
+later, and Keeper of Secrets can provide credentials later. The progress file
+contains stage evidence only; it never contains the artifact, file contents,
+filename, passphrase, or credential key.
+
 ## External security boundary
 
 Credential storage, encryption, compression, logins and identity management belong to the separate security service. UPMP accepts an optional authorization callback at action dispatch and an opaque `principal_ref`; it does not accept or store passwords, API keys, encryption keys or tokens. The callback is the seam for the external authorization engine.
