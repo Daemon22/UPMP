@@ -4,6 +4,8 @@
 
 UPMP provides domain-neutral building blocks for process integrity: state observation, verification against explicit criteria, risk and recovery handling, and workflow orchestration. It supports adapters for software, services, agents and equipment while keeping domain-specific sensors, policies and actions outside the core.
 
+UPMP declares no third-party runtime dependencies. `pytest` and its support packages are needed only to run the test suite; optional signature tests also use `cryptography`.
+
 ## The four pillars
 
 | Pillar | Responsibility |
