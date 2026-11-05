@@ -37,6 +37,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _process_handlers import (
     fast_handler, slow_handler, infinite_loop_handler, raising_handler, counter_handler,
+    recover_handler,
 )
 
 from UPMP import (
@@ -205,18 +206,26 @@ class TestValidation:
 
 class TestLambdaHandlerLimitation:
     def test_lambda_handler_returns_failed_not_hang(self):
-        """LIMITATION: lambda handlers cannot be pickled for spawn.
-        On fork, the lambda is inherited via fork, so it actually
-        works — but on spawn it would fail. This test verifies the
-        dispatcher doesn't hang on either platform; the result is
-        either SUCCEEDED (fork) or FAILED (spawn)."""
+        """Non-importable lambdas fail immediately and clearly on every platform."""
         base = ActionDispatcher({"act"})
         base.register("act", lambda r, c: ActionResult(ActionStatus.SUCCEEDED, "lambda", c))
         preemptible = ProcessPreemptibleDispatcher(base, default_timeout_seconds=2.0)
-        # This either works (fork) or returns FAILED (spawn). Either
-        # way, it must not hang.
         result = preemptible.dispatch(ActionRequest(action="act"), state())
-        assert result.status in (ActionStatus.SUCCEEDED, ActionStatus.FAILED)
+        assert result.status == ActionStatus.FAILED
+        assert "module-level function" in result.message
+
+    def test_unpicklable_request_returns_failed_without_raising(self):
+        import threading
+
+        base = ActionDispatcher({"act"})
+        base.register("act", fast_handler)
+        preemptible = ProcessPreemptibleDispatcher(base, default_timeout_seconds=2.0)
+        request = ActionRequest(action="act", parameters={"lock": threading.Lock()})
+
+        result = preemptible.dispatch(request, state())
+
+        assert result.status == ActionStatus.FAILED
+        assert "could not be serialized" in result.message
 
 
 class TestOrchestratorIntegration:
@@ -241,10 +250,7 @@ class TestOrchestratorIntegration:
         step that completes normally."""
         base = ActionDispatcher({"slow", "recover"})
         base.register("slow", slow_handler)
-        base.register("recover", lambda r, c: ActionResult(
-            ActionStatus.SUCCEEDED, "recovered",
-            replace(c, observations={**c.observations,
-                                      "done": Observation(True, source="result")})))
+        base.register("recover", recover_handler)
         preemptible = ProcessPreemptibleDispatcher(base, default_timeout_seconds=0.1)
         steps = [
             WorkflowStep("s1", "slow", policy("pre"), policy("post"),

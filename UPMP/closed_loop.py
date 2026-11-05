@@ -314,6 +314,15 @@ class ClosedLoopOrchestrator:
                 audit_sink.append(event)
             return event
 
+        def _transition(step: WorkflowStep, target: Optional[str], via: str) -> Optional[str]:
+            if target is not None:
+                _record(self._event("branch_transition", step, {
+                    "from": step.step_id,
+                    "to": target,
+                    "via": via,
+                }))
+            return target
+
         for _ in range(self.max_steps):
             # M2: check run-level cancellation and deadline at the top
             # of each step iteration. These are checked BEFORE the step
@@ -341,7 +350,10 @@ class ClosedLoopOrchestrator:
             _record(self._event("precondition_verified", step, self._verification_details(before)))
             if before.status != FindingStatus.PASS:
                 _record(self._event("dispatch_blocked", step, {"reason": before.status.value}))
-                step_id = step.on_indeterminate if before.status == FindingStatus.INDETERMINATE else step.on_failure
+                if before.status == FindingStatus.INDETERMINATE:
+                    step_id = _transition(step, step.on_indeterminate, "on_indeterminate")
+                else:
+                    step_id = _transition(step, step.on_failure, "on_failure")
                 if step_id is None:
                     status = RunStatus.BLOCKED if before.status == FindingStatus.INDETERMINATE else RunStatus.FAILED
                     return WorkflowResult(status, current, step.step_id, before, tuple(actions), tuple(audit))
@@ -353,10 +365,12 @@ class ClosedLoopOrchestrator:
                 cancellation_token=self.cancellation_token,
             )
             attempt = 0
+            step_elapsed = 0.0
             while True:
                 dispatch_start = time.monotonic()
                 result = self.dispatcher.dispatch(request, current)
                 elapsed = time.monotonic() - dispatch_start
+                step_elapsed += elapsed
                 # M2: per-step timeout check (post-hoc, not preemptive).
                 # If the handler took longer than step.timeout_seconds,
                 # treat the result as INDETERMINATE with reason "timeout"
@@ -381,19 +395,28 @@ class ClosedLoopOrchestrator:
                 if branch is None:
                     status = RunStatus.BLOCKED if result.status in (ActionStatus.DENIED, ActionStatus.INDETERMINATE) else RunStatus.FAILED
                     return WorkflowResult(status, current, step.step_id, last_verification, tuple(actions), tuple(audit))
-                step_id = branch
+                via = "on_indeterminate" if result.status == ActionStatus.INDETERMINATE else "on_failure"
+                step_id = _transition(step, branch, via)
                 continue
 
             current = result.state
-            after = step.postconditions.evaluate(current, moment)
+            # Check postconditions against action completion time so fresh
+            # observations recorded by a long-running handler are not treated
+            # as future-dated. An injected logical clock advances by the
+            # measured action duration to keep deterministic runs consistent.
+            postcondition_moment = (
+                datetime.now(timezone.utc) if now is None
+                else moment + timedelta(seconds=step_elapsed)
+            )
+            after = step.postconditions.evaluate(current, postcondition_moment)
             last_verification = after
             _record(self._event("postcondition_verified", step, self._verification_details(after)))
             if after.status == FindingStatus.PASS:
-                step_id = step.on_success
+                step_id = _transition(step, step.on_success, "on_success")
             elif after.status == FindingStatus.FAIL:
-                step_id = step.on_failure
+                step_id = _transition(step, step.on_failure, "on_failure")
             else:
-                step_id = step.on_indeterminate
+                step_id = _transition(step, step.on_indeterminate, "on_indeterminate")
             if step_id is None:
                 if after.status == FindingStatus.PASS:
                     return WorkflowResult(RunStatus.COMPLETED, current, None, after, tuple(actions), tuple(audit))

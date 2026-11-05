@@ -1,5 +1,5 @@
 """
-UPMP — Universal Progress Monitoring Package
+UPMP — Universal Process Monitoring Package
 ==============================================
 A domain-independent architectural framework for monitoring, verifying, and
 insuring the integrity of any complex process.
@@ -43,7 +43,7 @@ Usage:
     print(report.summary())
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 __author__ = "UPMP Framework"
 __license__ = "MIT"
 
@@ -129,6 +129,18 @@ from .closed_loop import (
     AuthorizationCheck,
 )
 
+from .diagnostics import (
+    DiagnosticCode, DiagnosticSeverity, StepOutcome, StepDiagnosis,
+    WorkflowIssue, WorkflowDiagnosis, diagnose_workflow,
+)
+from .flow_graph import (
+    ApplicationNavigation, ApplicationScreen, ApplicationTransition,
+    FlowCatalog, FlowEdge, FlowGraph, FlowNode, FlowScope,
+    application_flow_graph, build_flow_graph, flow_scope,
+    layout_flow_graph, workflow_flow_graph,
+)
+from .craft_adapter import craft_progress_flow_graph, read_craft_progress_jsonl
+
 __all__ = [
     # Version
     "__version__",
@@ -166,5 +178,15 @@ __all__ = [
     "VerificationPolicy", "ActionStatus", "RunStatus", "ActionRequest",
     "ActionResult", "WorkflowStep", "AuditEvent", "WorkflowResult",
     "ActionDispatcher", "ClosedLoopOrchestrator", "AuthorizationCheck",
+    # Step-by-step workflow diagnosis
+    "DiagnosticCode", "DiagnosticSeverity", "StepOutcome", "StepDiagnosis",
+    "WorkflowIssue", "WorkflowDiagnosis", "diagnose_workflow",
+    # Process and application flow maps
+    "ApplicationNavigation", "ApplicationScreen", "ApplicationTransition",
+    "FlowCatalog", "FlowEdge", "FlowGraph", "FlowNode", "FlowScope",
+    "application_flow_graph", "build_flow_graph", "flow_scope",
+    "layout_flow_graph", "workflow_flow_graph",
+    # CRAFT Engine progress stream integration
+    "craft_progress_flow_graph", "read_craft_progress_jsonl",
 ]
 
