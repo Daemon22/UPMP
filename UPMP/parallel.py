@@ -82,6 +82,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future, CancelledError, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .cancellation import CancellationToken, NEVER_CANCELLED
@@ -301,18 +302,33 @@ class ParallelOrchestrator:
                  max_steps: int = 1000,
                  max_concurrency: int = 4,
                  audit_sink: Optional[Any] = None,
-                 cancellation_token: Optional[CancellationToken] = None) -> None:
+                 cancellation_token: Optional[CancellationToken] = None,
+                 audit_metadata: Optional[Mapping[str, str]] = None) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
         if audit_sink is not None and not callable(getattr(audit_sink, "append", None)):
             raise TypeError("audit_sink must provide append(event) -> int")
+        if audit_metadata is not None:
+            if not isinstance(audit_metadata, Mapping):
+                raise TypeError("audit_metadata must be a mapping of string keys and values")
+            reserved_metadata_keys = {
+                "run_id", "status", "policy", "version", "findings", "action",
+                "principal_ref", "request_id", "message", "idempotency_key",
+                "attempt", "elapsed_seconds", "reason", "not_before", "from",
+                "to", "via",
+            }
+            if any(not isinstance(key, str) or not key or key in reserved_metadata_keys
+                   or not isinstance(value, str) for key, value in audit_metadata.items()):
+                raise ValueError("audit_metadata keys must not collide with runtime event fields and values must be strings")
+            audit_metadata = MappingProxyType(dict(audit_metadata))
         self.dag = dag
         self.dispatcher = dispatcher
         self.max_steps = max_steps
         self.max_concurrency = max_concurrency
         self.audit_sink = audit_sink
+        self.audit_metadata = audit_metadata
         self.cancellation_token = cancellation_token if cancellation_token is not None else NEVER_CANCELLED
         # Lock serializing all audit_sink.append() calls AND dispatcher
         # dispatch calls (the dispatcher's idempotency store is not
@@ -344,11 +360,14 @@ class ParallelOrchestrator:
 
         def _record(event: AuditEvent, branch_id: str) -> AuditEvent:
             """Stamp branch_id, append to in-memory list and durable sink."""
+            details = dict(event.details)
+            if self.audit_metadata is not None:
+                details.update({"run_id": run_id, **self.audit_metadata})
             stamped = AuditEvent(
                 event=event.event,
                 step_id=event.step_id,
                 timestamp=event.timestamp,
-                details=event.details,
+                details=details,
                 branch_id=branch_id,
             )
             audit.append(stamped)

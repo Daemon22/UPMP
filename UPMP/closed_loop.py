@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .contracts import FindingStatus, ProcessState, VerificationPolicy, VerificationResult
@@ -247,14 +248,29 @@ class ClosedLoopOrchestrator:
     def __init__(self, steps: Sequence[WorkflowStep], dispatcher: ActionDispatcher,
                  max_steps: int = 100,
                  audit_sink: Optional["AuditSink"] = None,
-                 cancellation_token: Optional[CancellationToken] = None) -> None:
+                 cancellation_token: Optional[CancellationToken] = None,
+                 audit_metadata: Optional[Mapping[str, str]] = None) -> None:
         if not steps:
             raise ValueError("workflow needs at least one step")
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
         if audit_sink is not None and not callable(getattr(audit_sink, "append", None)):
             raise TypeError("audit_sink must provide append(event) -> int")
+        if audit_metadata is not None:
+            if not isinstance(audit_metadata, Mapping):
+                raise TypeError("audit_metadata must be a mapping of string keys and values")
+            reserved_metadata_keys = {
+                "run_id", "status", "policy", "version", "findings", "action",
+                "principal_ref", "request_id", "message", "idempotency_key",
+                "attempt", "elapsed_seconds", "reason", "not_before", "from",
+                "to", "via",
+            }
+            if any(not isinstance(key, str) or not key or key in reserved_metadata_keys
+                   or not isinstance(value, str) for key, value in audit_metadata.items()):
+                raise ValueError("audit_metadata keys must not collide with runtime event fields and values must be strings")
+            audit_metadata = MappingProxyType(dict(audit_metadata))
         self.audit_sink = audit_sink
+        self.audit_metadata = audit_metadata
         # M2: bind the run-level cancellation token. None means "use
         # NEVER_CANCELLED" — handlers see a token that is never set, so
         # existing code paths that never check the token behave identically
@@ -309,6 +325,14 @@ class ClosedLoopOrchestrator:
         audit_sink = self.audit_sink
 
         def _record(event: AuditEvent) -> AuditEvent:
+            if self.audit_metadata is not None:
+                event = AuditEvent(
+                    event=event.event,
+                    step_id=event.step_id,
+                    timestamp=event.timestamp,
+                    details={**event.details, "run_id": run_id, **self.audit_metadata},
+                    branch_id=event.branch_id,
+                )
             audit.append(event)
             if audit_sink is not None:
                 audit_sink.append(event)

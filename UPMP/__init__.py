@@ -140,6 +140,12 @@ from .flow_graph import (
     layout_flow_graph, workflow_flow_graph,
 )
 from .craft_adapter import craft_progress_flow_graph, read_craft_progress_jsonl
+from .observatory import (
+    CheckpointStatus, CheckpointView, GoalOutcome, PartRunView,
+    ProcessCharter, ProcessPart, ProcessRunTracker, ProcessRunView,
+    StepRunView, build_process_run_view, write_process_run_snapshot,
+)
+from .observatory_server import make_observatory_server, serve_observatory
 
 __all__ = [
     # Version
@@ -188,5 +194,10 @@ __all__ = [
     "layout_flow_graph", "workflow_flow_graph",
     # CRAFT Engine progress stream integration
     "craft_progress_flow_graph", "read_craft_progress_jsonl",
+    # Chartered process observatory and read-only live snapshot bridge
+    "CheckpointStatus", "CheckpointView", "GoalOutcome", "PartRunView",
+    "ProcessCharter", "ProcessPart", "ProcessRunTracker", "ProcessRunView",
+    "StepRunView", "build_process_run_view", "write_process_run_snapshot",
+    "make_observatory_server", "serve_observatory",
 ]
 
